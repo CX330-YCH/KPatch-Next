@@ -3,7 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/rculist.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
+#include <kp_spinlock.h>
 #include <linux/list.h>
 #include <compiler.h>
 #include <stdbool.h>
@@ -33,13 +33,13 @@ static void reclaim_callback(struct rcu_head *rcu)
 
 int try_alloc_kstroage_group()
 {
-    spin_lock(&used_max_group_lock);
+    unsigned long flags = kp_private_spin_lock(&used_max_group_lock);
     if (used_max_group + 1 >= KSTRORAGE_MAX_GROUP_NUM) {
-        spin_unlock(&used_max_group_lock);
+        kp_private_spin_unlock(&used_max_group_lock, flags);
         return -1;
     }
     used_max_group++;
-    spin_unlock(&used_max_group_lock);
+    kp_private_spin_unlock(&used_max_group_lock, flags);
     return used_max_group;
 }
 
@@ -89,14 +89,14 @@ int write_kstorage(int gid, long did, void *data, int offset, int len, bool data
     }
     new->dlen = len;
 
-    spin_lock(lock);
+    unsigned long flags = kp_private_spin_lock(lock);
     if (old) { // update
         list_replace_rcu(&old->list, &new->list);
     } else { // add new one
         list_add_rcu(&new->list, head);
         group_sizes[gid]++;
     }
-    spin_unlock(lock);
+    kp_private_spin_unlock(lock, flags);
 
     rcu_read_unlock();
 
@@ -225,13 +225,13 @@ int remove_kstorage(int gid, long did)
     spinlock_t *lock = &kstorage_glocks[gid];
     struct kstorage *pos = 0;
 
-    spin_lock(lock);
+    unsigned long flags = kp_private_spin_lock(lock);
 
     list_for_each_entry(pos, head, list)
     {
         if (pos->did == did) {
             list_del_rcu(&pos->list);
-            spin_unlock(lock);
+            kp_private_spin_unlock(lock, flags);
 
             group_sizes[gid]--;
 
@@ -246,7 +246,7 @@ int remove_kstorage(int gid, long did)
         }
     }
 
-    spin_unlock(lock);
+    kp_private_spin_unlock(lock, flags);
 
     return 0;
 }
