@@ -51,7 +51,13 @@ without reading beyond the caller's argument string.
 `make -C kernel TARGET_COMPILE=unused hdr && make -C tools` builds native kptools.
 `python3 checks/test_preset_upgrade.py tools/kptools` tests legacy and enlarged
 KP2026 headers, exact unpatch round trips, false-positive magic, truncated presets,
-invalid embedded-item lengths/counts, unterminated banners and tiny images.
+invalid embedded-item lengths/counts, legacy aligned arguments without a NUL,
+unterminated banners and tiny images.
+
+`python3 checks/test_real_upgrade.py KPTTOOLS PATCHED_KERNEL KPIMG` performs
+two successive offline repatches with legacy 16/32-byte arguments, checks
+argument/payload preservation, stable image_size/start_offset and exact unpatch
+recovery. Input files and devices are not modified.
 
 The CI workflow builds the ARM64 core, Android arm64 tools/CLI and demo KPMs.
 Real-device boot-image patch/repatch/unpatch tests and Android CLI checks must be

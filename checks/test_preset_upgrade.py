@@ -81,6 +81,24 @@ class PresetUpgrade(unittest.TestCase):
         original[128:] = b'Linux version 6.12.30' + b'x' * (4096-128-len(b'Linux version 6.12.30'))
         self.assertNotEqual(self.call(original, '-l').returncode, 0)
 
+    def test_legacy_aligned_arguments_are_bounded(self):
+        for arglen in (16, 32):
+            args = b'a' * arglen
+            content = b'PAYLOAD_BOUNDARY'
+            extra = bytearray(128)
+            extra[:4] = b'kpe\0'
+            struct.pack_into('<iii', extra, 8, arglen, len(content), 4)
+            extra[20:24] = b'raw\0'
+            original, patched = image(extra=extra + args + content + bytes(128))
+            listed = self.call(patched, '-l')
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertIn('args=' + args.decode() + '\n', listed.stdout)
+            self.assertNotIn('PAYLOAD', listed.stdout)
+            dest = self.path / 'original'
+            unpatched = self.call(patched, '-u', '-o', str(dest))
+            self.assertEqual(unpatched.returncode, 0, unpatched.stderr)
+            self.assertEqual(dest.read_bytes(), original)
+
     def test_tiny_image_rejected(self):
         self.assertNotEqual(self.call(b'ARM\x64', '-l').returncode, 0)
 

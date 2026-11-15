@@ -192,21 +192,17 @@ void print_preset_info(preset_t *preset)
 
     fprintf(stdout, INFO_KP_IMG_SESSION "\n");
     fprintf(stdout, "version=0x%x\n", ver_num);
-    fprintf(stdout, "compile_time=%s\n", header->compile_time);
+    fprintf(stdout, "compile_time=%.*s\n", COMPILE_TIME_LEN, header->compile_time);
     fprintf(stdout, "config=%s,%s\n", "linux", is_debug ? "debug" : "release");
 
     fprintf(stdout, INFO_ADDITIONAL_SESSION "\n");
-    char *addition = setup->additional;
-
-    char *pos = addition;
-    while (pos < addition + ADDITIONAL_LEN) {
-        int len = *pos;
+    const char *pos = setup->additional;
+    const char *end = pos + ADDITIONAL_LEN;
+    while (pos < end) {
+        unsigned int len = (unsigned char)*pos++;
         if (!len) break;
-        pos++;
-        char backup = *(pos + len);
-        *(pos + len) = 0;
-        fprintf(stdout, "%s\n", pos);
-        *(pos + len) = backup;
+        if (len > (unsigned int)(end - pos)) tools_loge_exit("invalid additional metadata\n");
+        fprintf(stdout, "%.*s\n", len, pos);
         pos += len;
     }
 }
@@ -228,7 +224,9 @@ int print_kp_image_info_path(const char *kpimg_path)
     return rc;
 }
 
-int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
+/* Normalizes the caller-owned mutable Image buffer in place for repatching.
+ * The returned pointers borrow this buffer and remain valid only while it lives. */
+static int parse_image_patch_info(char *kimg, int kimg_len, patched_kimg_t *pimg)
 {
     pimg->kimg = kimg;
     pimg->kimg_len = kimg_len;
@@ -236,8 +234,8 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
     if (kimg_len < 64) tools_loge_exit("truncated kernel image\n");
     preset_t *old_preset = find_patched_preset(kimg, kimg_len);
     if (old_preset) {
-        memcpy((char *)kimg, old_preset->setup.header_backup, HDR_BACKUP_SIZE);
-        restore_header_image_size((char *)kimg, kimg_len, old_preset);
+        memcpy(kimg, old_preset->setup.header_backup, HDR_BACKUP_SIZE);
+        restore_header_image_size(kimg, kimg_len, old_preset);
     }
 
     // kernel image infomation
@@ -275,8 +273,6 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
     tools_logi("patched kernel image ...\n");
     pimg->ori_kimg_len = saved_kimg_len;
 
-    memcpy((char *)kimg, old_preset->setup.header_backup, sizeof(old_preset->setup.header_backup));
-
     // extra
     int extra_offset = align_kimg_len + u64le(old_preset->setup.kpimg_size);
     if (extra_offset > kimg_len) tools_loge_exit("kpimg length mismatch\n");
@@ -294,30 +290,20 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
         if (memcmp(EXTRA_HDR_MAGIC, item->magic, sizeof(item->magic))) break;
         if (item->type == EXTRA_TYPE_NONE) break;
         if (item->args_size < 0 || item->con_size < 0 ||
+            ((item->args_size | item->con_size) & (EXTRA_ALIGN - 1)) ||
             (uint64_t)item->args_size + item->con_size >
                 (uint64_t)(extra_end - item_pos - sizeof(*item)))
             tools_loge_exit("invalid extra item sizes\n");
         if (!memchr(item->name, 0, sizeof(item->name)) || !memchr(item->event, 0, sizeof(item->event)))
             tools_loge_exit("unterminated extra metadata\n");
-        if (item->args_size && !memchr(item_pos + sizeof(*item), 0, item->args_size))
-            tools_loge_exit("unterminated extra arguments\n");
+        /* Original Next stored exact 16-byte argument strings without a NUL.
+         * Accept this legacy encoding; consumers must respect args_size. */
         if (pimg->embed_item_num >= EXTRA_ITEM_MAX_NUM) tools_loge_exit("too many extra items\n");
         pimg->embed_item[pimg->embed_item_num++] = item;
         item_pos += sizeof(*item) + item->args_size + item->con_size;
     }
 
     return 0;
-}
-
-int parse_image_patch_info_path(const char *kimg_path, patched_kimg_t *pimg)
-{
-    if (!kimg_path) tools_loge_exit("empty kernel image\n");
-
-    kernel_file_t kernel_file;
-    read_kernel_file(kimg_path, &kernel_file);
-    int rc = parse_image_patch_info(kernel_file.kimg, kernel_file.kimg_len, pimg);
-    free_kernel_file(&kernel_file);
-    return rc;
 }
 
 int print_image_patch_info(patched_kimg_t *pimg)
@@ -348,7 +334,7 @@ int print_image_patch_info(patched_kimg_t *pimg)
             fprintf(stdout, "event=%s\n", item->event);
             fprintf(stdout, "priority=%d\n", item->priority);
             fprintf(stdout, "args_size=0x%x\n", item->args_size);
-            fprintf(stdout, "args=%s\n", item->args_size > 0 ? (char *)item + sizeof(*item) : "");
+            fprintf(stdout, "args=%.*s\n", item->args_size, (char *)item + sizeof(*item));
             fprintf(stdout, "con_size=0x%x\n", item->con_size);
 
             if (item->type == EXTRA_TYPE_KPM) {
@@ -452,6 +438,9 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     // extra
     int extra_size = 0;
     int extra_num = 0;
+    char *inherited_args[EXTRA_ITEM_MAX_NUM] = { 0 };
+    if (extra_config_num < 0 || extra_config_num > EXTRA_ITEM_MAX_NUM)
+        tools_loge_exit("too many extra items\n");
 
     for (int i = 0; i < extra_config_num; i++) {
         extra_config_t *config = extra_configs + i;
@@ -491,8 +480,9 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
         } else {
             const char *name = config->name;
             for (int j = 0; j < pimg.embed_item_num; j++) {
-                item = pimg.embed_item[j];
-                if (strcmp(name, item->name)) continue;
+                patch_extra_item_t *candidate = pimg.embed_item[j];
+                if (strcmp(name, candidate->name)) continue;
+                item = candidate;
                 if (is_be() ^ kinfo->is_be) {
                     item->type = i32swp(item->type);
                     item->priority = i32swp(item->priority);
@@ -500,7 +490,12 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
                     item->args_size = i32swp(item->args_size);
                 }
                 if (!config->set_args && item->args_size > 0) {
-                    config->set_args = (char *)item + sizeof(*item);
+                    /* Bounded copy handles legacy aligned strings with no NUL,
+                     * and keeps the original content offset independent of the
+                     * larger, NUL-terminated args area written below. */
+                    inherited_args[i] = strndup((char *)item + sizeof(*item), item->args_size);
+                    if (!inherited_args[i]) tools_loge_exit("allocate extra arguments failed\n");
+                    config->set_args = inherited_args[i];
                 }
                 config->extra_type = item->type;
                 config->data = (char *)item + sizeof(*item) + item->args_size;
@@ -690,6 +685,7 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     write_kernel_file(&out_kernel_file, out_path);
 
     // free
+    for (int i = 0; i < extra_config_num; i++) free(inherited_args[i]);
     free(kallsym_kimg);
     free(kpimg);
     free_kernel_file(&out_kernel_file);
