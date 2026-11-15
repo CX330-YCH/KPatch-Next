@@ -541,7 +541,7 @@ long module_control0(const char *name, const char *ctl_args, char *__user out_ms
         goto out;
     }
 
-    if (!*mod->ctl0) {
+    if (!mod->ctl0 || !*mod->ctl0) {
         logkfe("no ctl0\n");
         rc = -ENOSYS;
         goto out;
@@ -577,7 +577,7 @@ long module_control1(const char *name, void *a1, void *a2, void *a3)
         goto out;
     }
 
-    if (!*mod->ctl1) {
+    if (!mod->ctl1 || !*mod->ctl1) {
         logkfe("no ctl1\n");
         rc = -ENOSYS;
         goto out;
@@ -630,7 +630,12 @@ int list_modules(char *out_names, int size)
     int off = 0;
     list_for_each_entry(pos, &modules.list, list)
     {
-        off += snprintf(out_names + off, size - 1 - off, "%s\n", pos->info.name);
+        int n = snprintf(out_names + off, size - off, "%s\n", pos->info.name);
+        if (n < 0 || n >= size - off) {
+            rcu_read_unlock();
+            return -ENOBUFS;
+        }
+        off += n;
     }
     if (off > 0) out_names[off - 1] = '\0';
 
@@ -640,7 +645,7 @@ int list_modules(char *out_names, int size)
 
 int get_module_info(const char *name, char *out_info, int size)
 {
-    if (size <= 0) return 0;
+    if (!name || !out_info || size <= 0) return -EINVAL;
     rcu_read_lock();
 
     struct module *mod = find_module(name);
@@ -649,7 +654,7 @@ int get_module_info(const char *name, char *out_info, int size)
         return -ENOENT;
     }
 
-    int sz = snprintf(out_info, size - 1,
+    int sz = snprintf(out_info, size,
                       "name=%s\n"
                       "version=%s\n"
                       "license=%s\n"
@@ -657,7 +662,11 @@ int get_module_info(const char *name, char *out_info, int size)
                       "description=%s\n"
                       "args=%s\n",
                       mod->info.name, mod->info.version, mod->info.license, mod->info.author, mod->info.description,
-                      mod->args);
+                      mod->args ? mod->args : "");
+    if (sz < 0 || sz >= size) {
+        rcu_read_unlock();
+        return -ENOBUFS;
+    }
 
     if (sz > 0) out_info[sz - 1] = '\0';
     logkfd("%s", out_info);
