@@ -1,0 +1,63 @@
+name: Validate and build pinned core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/sync-kernelpatch"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM64 compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libz-dev
+      - name: Build core and demo modules
+        run: |
+          set -euxo pipefail
+          make -C kernel TARGET_COMPILE=aarch64-linux-gnu- -j2
+          mkdir -p dist
+          cp kernel/kpimg dist/kpimg-linux
+          cp kernel/kpimg.elf dist/
+          for demo in demo-hello demo-inlinehook demo-syscallhook; do
+            make -C "kpms/$demo" TARGET_COMPILE=aarch64-linux-gnu-
+            cp kpms/"$demo"/*.kpm dist/
+          done
+          aarch64-linux-gnu-readelf -h dist/kpimg.elf
+      - name: Build and smoke test Linux tools
+        run: |
+          cmake -S tools -B tools/build/linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build tools/build/linux -j2
+          cp tools/build/linux/kptools dist/kptools-linux
+          dist/kptools-linux -v
+          dist/kptools-linux -l -k dist/kpimg-linux
+          dist/kptools-linux -l -M dist/hello.kpm
+          python3 checks/test_preset_upgrade.py dist/kptools-linux
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26b
+      - name: Build Android ARM64 tools
+        env:
+          NDK_PATH: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euxo pipefail
+          for component in tools user; do
+            cmake -S "$component" -B "$component/build/android" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+              -DCMAKE_BUILD_TYPE=Release -DANDROID_PLATFORM=android-33 -DANDROID_ABI=arm64-v8a
+            cmake --build "$component/build/android" -j2
+          done
+          cp tools/build/android/kptools dist/kptools-android
+          cp user/build/android/kpatch dist/kpatch-android
+          file dist/*
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+          (cd dist && sha256sum kpimg-linux kpimg.elf kptools-linux kptools-android kpatch-android *.kpm > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kpatch-next-core-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
