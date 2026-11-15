@@ -13,6 +13,8 @@
 #include <assert.h>
 #include <string.h>
 #include <ctype.h>
+#include <stddef.h>
+#include <limits.h>
 
 #include "patch.h"
 #include "kallsym.h"
@@ -72,7 +74,9 @@ void free_kernel_file(kernel_file_t *kernel_file)
 preset_t *get_preset(const char *kimg, int kimg_len)
 {
     char magic[MAGIC_LEN] = KP_MAGIC;
-    return (preset_t *)memmem(kimg, kimg_len, magic, sizeof(magic));
+    if (kimg_len < (int)sizeof(preset_t)) return NULL;
+    /* A magic string near EOF is not a complete serialized preset. */
+    return (preset_t *)memmem(kimg, kimg_len - sizeof(preset_t) + sizeof(magic), magic, sizeof(magic));
 }
 
 uint32_t get_kpimg_version(const char *kpimg_path)
@@ -117,6 +121,55 @@ const char *extra_type_str(extra_item_type extra_type)
     default:
         return EXTRA_TYPE_NONE_STR;
     }
+}
+
+/* Keep the KP2026 disk ABI unchanged. Upstream's KP1158 preset has a
+ * different map table and authentication fields and must not be reinterpreted
+ * as this layout. These assertions also cover upgrades from the original Next. */
+_Static_assert(offsetof(setup_preset_t, header_backup) == 144, "Next preset ABI drift");
+_Static_assert(offsetof(setup_preset_t, additional) == 728, "Next additional ABI drift");
+
+static bool valid_header_backup(const uint8_t *header)
+{
+    uint32_t entry;
+    memcpy(&entry, header + (!memcmp(header, "MZ", 2) ? 4 : 0), sizeof(entry));
+    return (u32le(entry) & 0xfc000000) == 0x14000000;
+}
+
+/* Adapted from KernelPatch 55c439f: validate a preset and restore its saved
+ * entry before parsing the ARM64 Image header on an upgrade. */
+static preset_t *find_patched_preset(const char *kimg, int kimg_len)
+{
+    const char *cursor = kimg;
+    while (cursor < kimg + kimg_len) {
+        preset_t *preset = get_preset(cursor, kimg + kimg_len - cursor);
+        if (!preset) break;
+        uint64_t offset = (const char *)preset - kimg;
+        if (offset & (SZ_4K - 1)) {
+            cursor = (const char *)preset + 1;
+            continue;
+        }
+        uint64_t saved_len = u64le(preset->setup.kimg_size);
+        uint64_t core_len = u64le(preset->setup.kpimg_size);
+        if (saved_len >= 64 && saved_len <= offset &&
+            offset == ((saved_len + SZ_4K - 1) & ~(uint64_t)(SZ_4K - 1)) &&
+            core_len >= sizeof(*preset) && core_len <= (uint64_t)kimg_len - offset &&
+            valid_header_backup(preset->setup.header_backup)) return preset;
+        cursor = (const char *)preset + 1;
+    }
+    return NULL;
+}
+
+/* Upstream 9e034e0: preserve the original memory footprint when repatching or
+ * unpatching an image whose header was enlarged to cover the relocated core. */
+static void restore_header_image_size(char *kimg, int kimg_len, const preset_t *preset)
+{
+    if (kimg_len < 24) return;
+    uint64_t original = u64le(preset->setup.kernel_size), current;
+    memcpy(&current, kimg + 16, sizeof(current));
+    current = u64le(current);
+    if (original && original < current)
+        memcpy(kimg + 16, &preset->setup.kernel_size, sizeof(current));
 }
 
 static char *bytes_to_hexstr(const unsigned char *data, int len)
@@ -180,6 +233,13 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
     pimg->kimg = kimg;
     pimg->kimg_len = kimg_len;
 
+    if (kimg_len < 64) tools_loge_exit("truncated kernel image\n");
+    preset_t *old_preset = find_patched_preset(kimg, kimg_len);
+    if (old_preset) {
+        memcpy((char *)kimg, old_preset->setup.header_backup, HDR_BACKUP_SIZE);
+        restore_header_image_size((char *)kimg, kimg_len, old_preset);
+    }
+
     // kernel image infomation
     kernel_info_t *kinfo = &pimg->kinfo;
     if (get_kernel_info(kinfo, kimg, kimg_len)) tools_loge_exit("get_kernel_info error\n");
@@ -188,42 +248,21 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
     char linux_banner_prefix[] = "Linux version ";
     size_t prefix_len = strlen(linux_banner_prefix);
     const char *imgend = pimg->kimg + pimg->kimg_len;
-    const char *banner = (char *)pimg->kimg;
-    while ((banner = (char *)memmem(banner + 1, imgend - banner, linux_banner_prefix, prefix_len)) != NULL) {
-        if (isdigit(*(banner + prefix_len)) && *(banner + prefix_len + 1) == '.') {
+    const char *banner = pimg->kimg;
+    while (banner < imgend &&
+           (banner = memmem(banner, imgend - banner, linux_banner_prefix, prefix_len))) {
+        if (imgend - banner > (ptrdiff_t)prefix_len + 1 &&
+            isdigit((unsigned char)banner[prefix_len]) && banner[prefix_len + 1] == '.' &&
+            memchr(banner, 0, imgend - banner)) {
             pimg->banner = banner;
             break;
         }
+        banner++;
     }
     if (!pimg->banner) tools_loge_exit("can't find linux banner\n");
 
-    // patched or new
-    preset_t *old_preset = NULL;
-    const char *search_ptr = kimg;
-    int search_len = kimg_len;
-    int32_t saved_kimg_len = 0;
-    int align_kimg_len = 0;
-
-    while (search_len > 0) {
-        old_preset = get_preset(search_ptr, search_len);
-        if (!old_preset) break;
-
-        saved_kimg_len = old_preset->setup.kimg_size;
-        if (is_be() ^ kinfo->is_be) saved_kimg_len = i32swp(saved_kimg_len);
-
-        align_kimg_len = (char *)old_preset - kimg;
-        if (align_kimg_len == (int)align_ceil(saved_kimg_len, SZ_4K)) {
-            break;
-        }
-
-        tools_logw("found magic string at 0x%x but saved kernel image size mismatch, ignoring (false positive?)\n",
-                   align_kimg_len);
-
-        // Search next
-        search_ptr = (char *)old_preset + 1;
-        search_len = kimg_len - (search_ptr - kimg);
-        old_preset = NULL;
-    }
+    int saved_kimg_len = old_preset ? u64le(old_preset->setup.kimg_size) : 0;
+    int align_kimg_len = old_preset ? (const char *)old_preset - kimg : 0;
 
     pimg->preset = old_preset;
 
@@ -239,22 +278,32 @@ int parse_image_patch_info(const char *kimg, int kimg_len, patched_kimg_t *pimg)
     memcpy((char *)kimg, old_preset->setup.header_backup, sizeof(old_preset->setup.header_backup));
 
     // extra
-    int extra_offset = align_kimg_len + old_preset->setup.kpimg_size;
+    int extra_offset = align_kimg_len + u64le(old_preset->setup.kpimg_size);
     if (extra_offset > kimg_len) tools_loge_exit("kpimg length mismatch\n");
     if (extra_offset == kimg_len) return 0;
 
-    int32_t extra_size = old_preset->setup.extra_size;
-    if (is_be() ^ kinfo->is_be) extra_size = i32swp(extra_size);
+    uint64_t extra_size = u64le(old_preset->setup.extra_size);
+    if (extra_size > (uint64_t)(kimg_len - extra_offset)) tools_loge_exit("extra length mismatch\n");
     const char *item_pos = kimg + extra_offset;
+    const char *extra_end = item_pos + extra_size;
 
-    while (item_pos < kimg + extra_offset + extra_size) {
+    while (item_pos < extra_end) {
+        if (extra_end - item_pos < (ptrdiff_t)sizeof(patch_extra_item_t))
+            tools_loge_exit("truncated extra item\n");
         patch_extra_item_t *item = (patch_extra_item_t *)item_pos;
-        if (strcmp(EXTRA_HDR_MAGIC, item->magic)) break;
+        if (memcmp(EXTRA_HDR_MAGIC, item->magic, sizeof(item->magic))) break;
         if (item->type == EXTRA_TYPE_NONE) break;
+        if (item->args_size < 0 || item->con_size < 0 ||
+            (uint64_t)item->args_size + item->con_size >
+                (uint64_t)(extra_end - item_pos - sizeof(*item)))
+            tools_loge_exit("invalid extra item sizes\n");
+        if (!memchr(item->name, 0, sizeof(item->name)) || !memchr(item->event, 0, sizeof(item->event)))
+            tools_loge_exit("unterminated extra metadata\n");
+        if (item->args_size && !memchr(item_pos + sizeof(*item), 0, item->args_size))
+            tools_loge_exit("unterminated extra arguments\n");
+        if (pimg->embed_item_num >= EXTRA_ITEM_MAX_NUM) tools_loge_exit("too many extra items\n");
         pimg->embed_item[pimg->embed_item_num++] = item;
-        item_pos += sizeof(patch_extra_item_t);
-        item_pos += item->args_size;
-        item_pos += item->con_size;
+        item_pos += sizeof(*item) + item->args_size + item->con_size;
     }
 
     return 0;
@@ -462,7 +511,7 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
         strcpy(item->magic, EXTRA_HDR_MAGIC);
         config->item = item;
         item->type = config->extra_type;
-        if (config->set_args) item->args_size = align_ceil(strlen(config->set_args), EXTRA_ALIGN);
+        if (config->set_args) item->args_size = align_ceil(strlen(config->set_args) + 1, EXTRA_ALIGN);
         if (config->set_name) strcpy(item->name, config->set_name);
         if (config->set_event) strcpy(item->event, config->set_event);
         if (config->priority) item->priority = config->priority;
@@ -499,6 +548,12 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     memcpy(out_kernel_file.kimg, pimg.kimg, ori_kimg_len);
     memset(out_kernel_file.kimg + ori_kimg_len, 0, align_kimg_len - ori_kimg_len);
     memcpy(out_kernel_file.kimg + align_kimg_len, kpimg, kpimg_len);
+
+    /* Reserve the destination of setup1.S's relocated core in the ARM64
+     * boot protocol footprint, so the bootloader cannot place DTB/initrd there. */
+    uint64_t footprint = (uint64_t)start_offset + kpimg_len + extra_size;
+    if (footprint > INT_MAX - SZ_4K) tools_loge_exit("kernel footprint overflow\n");
+    kernel_resize(kinfo, out_kernel_file.kimg, align_ceil(footprint, SZ_4K));
 
     // set preset
     preset_t *preset = (preset_t *)(out_kernel_file.kimg + align_kimg_len);
@@ -619,7 +674,12 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
         }
 
         extra_append(out_kernel_file.kimg, (void *)item, sizeof(*item), &current_offset);
-        if (args_len > 0) extra_append(out_kernel_file.kimg, (void *)config->set_args, args_len, &current_offset);
+        if (args_len > 0) {
+            memset(out_kernel_file.kimg + current_offset, 0, args_len);
+            if (config->set_args)
+                memcpy(out_kernel_file.kimg + current_offset, config->set_args, strlen(config->set_args));
+            current_offset += args_len;
+        }
         extra_append(out_kernel_file.kimg, (void *)config->data, con_len, &current_offset);
     }
 
@@ -649,12 +709,13 @@ int unpatch_img(const char *kimg_path, const char *out_path)
     kernel_file_t kernel_file;
     read_kernel_file(kimg_path, &kernel_file);
 
-    preset_t *preset = get_preset(kernel_file.kimg, kernel_file.kimg_len);
+    preset_t *preset = find_patched_preset(kernel_file.kimg, kernel_file.kimg_len);
     if (!preset) tools_loge_exit("not patched kernel image\n");
 
     // todo: check whether the endian is different or not
     memcpy(kernel_file.kimg, preset->setup.header_backup, sizeof(preset->setup.header_backup));
-    int kimg_size = preset->setup.kimg_size ?: ((char *)preset - kernel_file.kimg);
+    restore_header_image_size(kernel_file.kimg, kernel_file.kimg_len, preset);
+    int kimg_size = u64le(preset->setup.kimg_size);
     update_kernel_file_img_len(&kernel_file, kimg_size, false);
 
     write_kernel_file(&kernel_file, out_path);
